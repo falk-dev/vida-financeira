@@ -10,7 +10,6 @@ import re
 import csv
 import json
 import calendar
-from apscheduler.schedulers.background import BackgroundScheduler
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -442,115 +441,11 @@ class ParsingInteligente:
 
 
 class VidaFinanceiraBot:
-    def generate_monthly_report(self) -> None:
-        """Gera o relatório CSV mensal e zera os gastos mantendo o saldo."""
-        hoje = date.today()
-        mes_anterior = hoje.replace(day=1) - timedelta(days=1)
-
-        # Conecta ao banco de dados
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        # Busca todos os usuários
-        cursor.execute("SELECT user_id FROM usuarios")
-        usuarios = cursor.fetchall()
-
-        for (user_id,) in usuarios:
-            # Calcula o saldo atual
-            cursor.execute(
-                """
-                SELECT COALESCE(SUM(CASE WHEN tipo = 'receita' THEN valor ELSE -valor END), 0)
-                FROM lancamentos
-                WHERE user_id = ? AND strftime('%Y-%m', data_referencia) = ?
-            """,
-                (user_id, mes_anterior.strftime("%Y-%m")),
-            )
-            saldo = cursor.fetchone()[0]
-
-            # Gera o nome do arquivo CSV
-            csv_filename = (
-                f"relatorios/relatorio_{user_id}_{mes_anterior.strftime('%Y_%m')}.csv"
-            )
-            os.makedirs("relatorios", exist_ok=True)
-
-            # Busca todos os lançamentos do mês
-            cursor.execute(
-                """
-                SELECT l.tipo, l.valor, l.descricao, c.nome as categoria, r.nome as responsavel,
-                       m.nome as metodo_pagamento, l.parcela_atual, l.total_parcelas,
-                       l.data_referencia
-                FROM lancamentos l
-                LEFT JOIN categorias c ON l.categoria_id = c.id
-                LEFT JOIN responsaveis r ON l.responsavel_id = r.id
-                LEFT JOIN metodos_pagamento m ON l.metodo_pagamento_id = m.id
-                WHERE l.user_id = ? AND strftime('%Y-%m', l.data_referencia) = ?
-                ORDER BY l.data_referencia, l.tipo
-            """,
-                (user_id, mes_anterior.strftime("%Y-%m")),
-            )
-
-            lancamentos = cursor.fetchall()
-
-            # Gera o arquivo CSV
-            with open(csv_filename, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(
-                    [
-                        "Tipo",
-                        "Valor",
-                        "Descrição",
-                        "Categoria",
-                        "Responsável",
-                        "Método de Pagamento",
-                        "Parcela",
-                        "Data",
-                    ]
-                )
-
-                for l in lancamentos:
-                    parcela_info = f"[{l[6]}/{l[7]}]" if l[6] and l[7] else ""
-                    writer.writerow(
-                        [l[0], l[1], l[2], l[3], l[4], l[5], parcela_info, l[8]]
-                    )
-
-                # Adiciona linha com o saldo final
-                writer.writerow(["", "", "", "", "", "", ""])
-                writer.writerow(["Saldo Final", saldo])
-
-            # Registra o relatório no banco de dados
-            cursor.execute(
-                """
-                INSERT INTO relatorios_mensais (user_id, mes, ano, arquivo_path)
-                VALUES (?, ?, ?, ?)
-            """,
-                (user_id, mes_anterior.month, mes_anterior.year, csv_filename),
-            )
-
-            # Zera os gastos do mês mantendo o saldo
-            if saldo > 0:
-                # Adiciona o saldo como receita inicial do novo mês
-                cursor.execute(
-                    """
-                    INSERT INTO lancamentos (user_id, tipo, valor, descricao, data_referencia)
-                    VALUES (?, 'receita', ?, 'Saldo do mês anterior', ?)
-                """,
-                    (user_id, saldo, hoje),
-                )
-
-        conn.commit()
-        conn.close()
-
     def __init__(self, token: str):
         """Inicializa o bot de vida financeira"""
         self.token = token
         self.db_path = "financeiro.db"
         self.parser = ParsingInteligente()
-        # Configura o scheduler para gerar relatório mensal
-        self.scheduler = BackgroundScheduler()
-        self.scheduler.add_job(
-            self.generate_monthly_report, "cron", day="1", hour="0", minute="0"
-        )
-        self.scheduler.start()
         self.init_database()
 
     def init_database(self):
@@ -1380,10 +1275,6 @@ def main():
     dispatcher.add_handler(CommandHandler("limites", listar_limites_command))
     dispatcher.add_handler(CommandHandler("reset", reset_command))
     dispatcher.add_handler(CommandHandler("mes", mes_command))
-    dispatcher.add_handler(CommandHandler("resetar_mes", resetar_mes_command))
-    dispatcher.add_handler(CommandHandler("resetar_tudo", resetar_tudo_command))
-    dispatcher.add_handler(CommandHandler("fixo", fixo_command))
-    dispatcher.add_handler(CommandHandler("apagar", apagar_command))
 
     # Handler para botões inline
     dispatcher.add_handler(CallbackQueryHandler(button_callback))
@@ -1410,126 +1301,18 @@ def start_command(update: Update, context: CallbackContext):
     )
 
 
-def resetar_mes_command(update: Update, context: CallbackContext):
-    """Comando /resetar_mes - Zera os gastos do mês mantendo o saldo"""
-    user = update.effective_user
-    bot_instance = context.bot_data.get("bot_instance")
-
-    if not bot_instance:
-        update.message.reply_text("❌ Erro interno: bot_instance não encontrado")
-        return
-
-    # Calcula o saldo atual
-    conn = sqlite3.connect(bot_instance.db_path)
-    cursor = conn.cursor()
-
-    hoje = date.today()
-    mes_atual = hoje.strftime("%Y-%m")
-
-    # Calcula saldo do mês
-    cursor.execute(
-        """
-        SELECT COALESCE(SUM(CASE WHEN tipo = 'receita' THEN valor ELSE -valor END), 0)
-        FROM lancamentos
-        WHERE user_id = ? AND strftime('%Y-%m', data_referencia) = ?
-    """,
-        (user.id, mes_atual),
-    )
-
-    saldo = cursor.fetchone()[0]
-
-    # Backup dos lançamentos antes de apagar
-    cursor.execute(
-        """
-        SELECT * FROM lancamentos
-        WHERE user_id = ? AND strftime('%Y-%m', data_referencia) = ?
-    """,
-        (user.id, mes_atual),
-    )
-
-    backup = cursor.fetchall()
-
-    # Apaga todos os lançamentos do mês
-    cursor.execute(
-        """
-        DELETE FROM lancamentos
-        WHERE user_id = ? AND strftime('%Y-%m', data_referencia) = ?
-    """,
-        (user.id, mes_atual),
-    )
-
-    # Se houver saldo positivo, cria um novo lançamento
-    if saldo > 0:
-        cursor.execute(
-            """
-            INSERT INTO lancamentos (user_id, tipo, valor, descricao, data_referencia)
-            VALUES (?, 'receita', ?, 'Saldo do mês anterior', ?)
-        """,
-            (user.id, saldo, hoje),
-        )
-
-    conn.commit()
-    conn.close()
-
-    update.message.reply_text(
-        f"✅ Mês resetado com sucesso!\n" f"💰 Saldo mantido: R$ {saldo:.2f}"
-    )
-
-
-def resetar_tudo_command(update: Update, context: CallbackContext):
-    """Comando /resetar_tudo - Zera todos os dados com confirmação"""
-    user = update.effective_user
-    bot_instance = context.bot_data.get("bot_instance")
-
-    if not context.args or context.args[0].lower() != "confirmar":
-        update.message.reply_text(
-            "⚠️ **ATENÇÃO**: Este comando irá apagar *TODOS* os seus dados!\n"
-            "Para confirmar, digite:\n"
-            "`/resetar_tudo confirmar`",
-            parse_mode="Markdown",
-        )
-        return
-
-    # Apaga todos os dados do usuário
-    conn = sqlite3.connect(bot_instance.db_path)
-    cursor = conn.cursor()
-
-    cursor.execute("DELETE FROM lancamentos WHERE user_id = ?", (user.id,))
-    cursor.execute("DELETE FROM metas WHERE user_id = ?", (user.id,))
-    cursor.execute("DELETE FROM categorias WHERE user_id = ?", (user.id,))
-    cursor.execute("DELETE FROM limites_gastos WHERE user_id = ?", (user.id,))
-
-    conn.commit()
-    conn.close()
-
-    update.message.reply_text(
-        "✅ Todos os dados foram resetados com sucesso!\n"
-        "Use /start para começar novamente."
-    )
-
-
 def help_command(update: Update, context: CallbackContext):
     """Comando /help - Lista todos os comandos"""
     help_text = """
 🤖 **Bot de Vida Financeira - Comandos**
 
-📊 **Lançamentos:**
-/add categoria, tipo, valor, descrição
-Exemplo: /add alimentação, despesa, 25,50, almoço no araujo
-Exemplo: /add salário, receita, 5000, trabalho freelance
-
-📅 **Despesas Fixas:**
-/fixo categoria, valor, quantidade_meses
-Exemplo: /fixo aluguel, 1000, 12
-
-🗑️ **Gerenciar Lançamentos:**
-/apagar ID - Remove um lançamento pelo ID
-/resetar_mes - Zera os gastos do mês mantendo o saldo
-/resetar_tudo - Zera todos os dados com confirmação
+📊 **Lançamentos Inteligentes:**
+/add alimentação despesa 25,50 almoço no araujo pix
+/add salário receita 5000 trabalho freelance nubank
+/add transporte despesa 15 uber para casa cartão
 
 💰 **Saldo e Relatórios:**
 /saldo - Ver saldo atual
-/mes MM-AAAA - Ver relatório mensal (ex: /mes 11-2025)
 /relatorio - Relatório mensal completo
 /grafico - Gráfico de gastos por categoria
 
@@ -1550,115 +1333,12 @@ Exemplo: /fixo aluguel, 1000, 12
 /reset - Resetar todos os dados (com confirmação)
 
 💡 **Dicas:**
-• Use vírgulas para separar os campos: categoria, tipo, valor, descrição
 • Use vírgula ou ponto para valores: 25,50 ou 25.50
 • O bot reconhece categorias automaticamente
 • Datas aceitas: 30-03-26, 30/03/2026
-• Use /mes para ver os IDs dos lançamentos antes de apagar
+• Comandos funcionam em qualquer ordem!
     """
     update.message.reply_text(help_text)
-
-
-def mes_command(update: Update, context: CallbackContext):
-    """Comando /mes - Ver relatório de um mês específico"""
-    user = update.effective_user
-    bot_instance = context.bot_data.get("bot_instance")
-
-    if not context.args:
-        update.message.reply_text(
-            "❌ Por favor, especifique o mês e ano no formato MM-AAAA\n"
-            "Exemplo: /mes 11-2025"
-        )
-        return
-
-    try:
-        mes_ano = context.args[0]
-        if not re.match(r"^\d{2}-\d{4}$", mes_ano):
-            raise ValueError("Formato inválido")
-
-        mes, ano = map(int, mes_ano.split("-"))
-        if mes < 1 or mes > 12:
-            raise ValueError("Mês inválido")
-
-        # Cria a data do primeiro dia do mês especificado
-        data_referencia = date(ano, mes, 1)
-
-        # Busca os lançamentos do mês
-        conn = sqlite3.connect(bot_instance.db_path)
-        cursor = conn.cursor()
-
-        # Calcula o saldo do mês
-        cursor.execute(
-            """
-            SELECT COALESCE(SUM(CASE WHEN tipo = 'receita' THEN valor ELSE -valor END), 0)
-            FROM lancamentos
-            WHERE user_id = ? AND strftime('%Y-%m', data_referencia) = ?
-        """,
-            (user.id, data_referencia.strftime("%Y-%m")),
-        )
-        saldo = cursor.fetchone()[0]
-
-        # Busca receitas e despesas separadamente
-        cursor.execute(
-            """
-            SELECT l.tipo, l.valor, l.descricao, c.nome as categoria,
-                   l.parcela_atual, l.total_parcelas
-            FROM lancamentos l
-            LEFT JOIN categorias c ON l.categoria_id = c.id
-            WHERE l.user_id = ? AND strftime('%Y-%m', l.data_referencia) = ?
-            ORDER BY l.data_referencia, l.tipo DESC
-        """,
-            (user.id, data_referencia.strftime("%Y-%m")),
-        )
-
-        lancamentos = cursor.fetchall()
-        conn.close()
-
-        if not lancamentos:
-            update.message.reply_text(
-                f"📊 Não há lançamentos registrados em {calendar.month_name[mes]}/{ano}"
-            )
-            return
-
-        # Formata a mensagem
-        total_receitas = sum(l[1] for l in lancamentos if l[0] == "receita")
-        total_despesas = sum(l[1] for l in lancamentos if l[0] == "despesa")
-
-        mensagem = f"📊 **Relatório de {calendar.month_name[mes]}/{ano}**\n\n"
-
-        # Receitas
-        mensagem += "💰 **Receitas:**\n"
-        for l in lancamentos:
-            if l[0] == "receita":
-                categoria = l[3] if l[3] else "Sem categoria"
-                parcela_info = f" [{l[4]}/{l[5]}]" if l[4] and l[5] else ""
-                mensagem += f"• {categoria}: R$ {l[1]:.2f}{parcela_info}\n"
-        mensagem += f"**Total Receitas: R$ {total_receitas:.2f}**\n\n"
-
-        # Despesas
-        mensagem += "💸 **Despesas:**\n"
-        for l in lancamentos:
-            if l[0] == "despesa":
-                categoria = l[3] if l[3] else "Sem categoria"
-                parcela_info = f" [{l[4]}/{l[5]}]" if l[4] and l[5] else ""
-                mensagem += f"• {categoria}: R$ {l[1]:.2f}{parcela_info}\n"
-        mensagem += f"**Total Despesas: R$ {total_despesas:.2f}**\n\n"
-
-        # Saldo
-        mensagem += f"📈 **Saldo do Mês: R$ {saldo:.2f}**"
-
-        update.message.reply_text(mensagem, parse_mode="Markdown")
-
-    except ValueError as e:
-        update.message.reply_text(
-            "❌ Formato inválido! Use MM-AAAA\n" "Exemplo: /mes 11-2025"
-        )
-    except Exception as e:
-        update.message.reply_text(
-            "❌ Erro ao buscar relatório do mês.\n"
-            "Certifique-se de usar o formato correto: MM-AAAA\n"
-            "Exemplo: /mes 11-2025"
-        )
 
 
 def add_lancamento_command(update: Update, context: CallbackContext):
@@ -1768,7 +1448,9 @@ def meta_command(update: Update, context: CallbackContext):
                     f"✅ Use /metas para ver todas as metas"
                 )
             else:
-                update.message.reply_text("❌ Erro ao criar meta. Tente novamente.")
+                update.message.reply_text(
+                    "❌ Erro ao criar meta. Tente novamente."
+                )
     else:
         update.message.reply_text("❌ Erro interno do bot. Tente novamente.")
 
@@ -1816,140 +1498,6 @@ def listar_metas_command(update: Update, context: CallbackContext):
             update.message.reply_text(texto_metas)
     else:
         update.message.reply_text("❌ Erro interno do bot. Tente novamente.")
-
-
-def fixo_command(update: Update, context: CallbackContext):
-    """Comando /fixo - Adiciona despesa fixa com repetição por até 12 meses"""
-    if not context.args or len(context.args) < 3:
-        update.message.reply_text(
-            "❌ Uso incorreto. Use:\n"
-            "/fixo categoria, valor, quantidade_meses\n"
-            "Exemplo: /fixo aluguel, 1000, 12"
-        )
-        return
-
-    entrada = " ".join(context.args).split(",")
-    if len(entrada) < 3:
-        update.message.reply_text(
-            "❌ Use o formato correto separando por vírgulas:\n"
-            "/fixo categoria, valor, quantidade_meses\n"
-            "Exemplo: /fixo aluguel, 1000, 12"
-        )
-        return
-
-    user = update.effective_user
-    bot_instance = context.bot_data.get("bot_instance")
-    if not bot_instance:
-        update.message.reply_text("❌ Erro interno do bot")
-        return
-
-    categoria = entrada[0].strip()
-    try:
-        valor = float(entrada[1].strip().replace("R$", "").replace(" ", ""))
-    except ValueError:
-        update.message.reply_text("❌ Valor inválido")
-        return
-
-    try:
-        meses = int(entrada[2].strip())
-        if meses < 1 or meses > 12:
-            update.message.reply_text("❌ Quantidade de meses deve ser entre 1 e 12")
-            return
-    except ValueError:
-        update.message.reply_text("❌ Quantidade de meses inválida")
-        return
-
-    # Adiciona lançamentos fixos
-    conn = sqlite3.connect(bot_instance.db_path)
-    cursor = conn.cursor()
-
-    hoje = date.today()
-
-    # Registra lançamentos para os próximos meses
-    for i in range(meses):
-        data_ref = hoje.replace(day=1) + timedelta(days=32 * i)
-        data_ref = data_ref.replace(day=1)  # Primeiro dia do mês
-
-        cursor.execute(
-            """
-            INSERT INTO lancamentos (
-                user_id, tipo, valor, descricao, data_referencia,
-                fixo_parcelas, fixo_parcela_atual
-            )
-            VALUES (?, 'despesa', ?, ?, ?, ?, ?)
-            """,
-            (user.id, valor, f"{categoria} (Fixo)", data_ref, meses, i + 1),
-        )
-
-    conn.commit()
-    conn.close()
-
-    update.message.reply_text(
-        f"✅ Despesa fixa adicionada!\n\n"
-        f"📊 Categoria: {categoria}\n"
-        f"💵 Valor: R$ {valor:.2f}\n"
-        f"🔄 Repetição: {meses} meses\n"
-    )
-
-
-def apagar_command(update: Update, context: CallbackContext):
-    """Comando /apagar - Remove um lançamento pelo ID"""
-    if not context.args:
-        update.message.reply_text(
-            "❌ Informe o ID do lançamento\n"
-            "Exemplo: /apagar 123\n"
-            "Use /mes para ver os lançamentos e seus IDs"
-        )
-        return
-
-    try:
-        lancamento_id = int(context.args[0])
-    except ValueError:
-        update.message.reply_text("❌ ID inválido")
-        return
-
-    user = update.effective_user
-    bot_instance = context.bot_data.get("bot_instance")
-
-    if not bot_instance:
-        update.message.reply_text("❌ Erro interno do bot")
-        return
-
-    # Busca o lançamento
-    conn = sqlite3.connect(bot_instance.db_path)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        SELECT l.*, c.nome as categoria
-        FROM lancamentos l
-        LEFT JOIN categorias c ON l.categoria_id = c.id
-        WHERE l.id = ? AND l.user_id = ?
-        """,
-        (lancamento_id, user.id),
-    )
-
-    lancamento = cursor.fetchone()
-
-    if not lancamento:
-        update.message.reply_text("❌ Lançamento não encontrado ou não pertence a você")
-        conn.close()
-        return
-
-    # Remove o lançamento
-    cursor.execute(
-        "DELETE FROM lancamentos WHERE id = ? AND user_id = ?", (lancamento_id, user.id)
-    )
-
-    conn.commit()
-    conn.close()
-
-    update.message.reply_text(
-        f"✅ Lançamento removido!\n\n"
-        f"🆔 ID: {lancamento_id}\n"
-        f"📊 Categoria: {lancamento['categoria']}\n"
-        f"💵 Valor: R$ {lancamento['valor']:.2f}\n"
-    )
 
 
 def relatorio_command(update: Update, context: CallbackContext):
@@ -2047,7 +1595,9 @@ def exportar_command(update: Update, context: CallbackContext):
                 # Limpar arquivo temporário
                 os.remove(filename)
             except Exception as e:
-                update.message.reply_text("❌ Erro ao enviar arquivo. Tente novamente.")
+                update.message.reply_text(
+                    "❌ Erro ao enviar arquivo. Tente novamente."
+                )
         else:
             update.message.reply_text(
                 "📤 **Exportação de Dados**\n\n"
@@ -2091,12 +1641,16 @@ def limite_command(update: Update, context: CallbackContext):
                     f"✅ Use /limites para ver todos os limites"
                 )
             else:
-                update.message.reply_text("❌ Erro ao definir limite. Tente novamente.")
+                update.message.reply_text(
+                    "❌ Erro ao definir limite. Tente novamente."
+                )
         else:
             update.message.reply_text("❌ Erro interno do bot. Tente novamente.")
 
     except ValueError:
-        update.message.reply_text("❌ Valor inválido. Use números como: 500 ou 500,50")
+        update.message.reply_text(
+            "❌ Valor inválido. Use números como: 500 ou 500,50"
+        )
 
 
 def listar_limites_command(update: Update, context: CallbackContext):
@@ -2278,7 +1832,9 @@ def mes_command(update: Update, context: CallbackContext):
         conn.close()
 
     except ValueError:
-        update.message.reply_text("Formato inválido. Use MM-YYYY (exemplo: 11-2025)")
+        update.message.reply_text(
+            "Formato inválido. Use MM-YYYY (exemplo: 11-2025)"
+        )
     except Exception as e:
         update.message.reply_text(f"Erro ao buscar lançamentos: {str(e)}")
 
