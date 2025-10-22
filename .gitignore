@@ -1,0 +1,6 @@
+.venv
+backup
+*.bat
+*backup*
+*update*
+*start*
